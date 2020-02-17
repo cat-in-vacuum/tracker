@@ -1,10 +1,12 @@
 package tracker
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/olekukonko/tablewriter"
 	"io"
+	"log"
 	"runtime"
 	"time"
 )
@@ -20,9 +22,9 @@ type Renderer interface {
 	Render(metadata MetaData, opt *Options)
 }
 
-//
+// the track is
 type Track struct {
-	Data          MetaData
+	Data          MetaData `json:"trackedData,omitempty"`
 	Loggable      bool
 	callerSkip    int
 	messageFormat string
@@ -30,18 +32,29 @@ type Track struct {
 	Renderer
 }
 
-// leverage of options on which be  final rendered the track info
-// withErrors - will add an errors field in output if error was send into Update()
+// contains meta information about current function
+type MetaData []Meta
+type Meta struct {
+	Name     string        `json:"name"`
+	Start    time.Time     `json:"start"`
+	Dur      time.Duration `json:"dur"`
+	StartDif time.Duration `json:"start_dif"`
+	Err      error         `json:"error"`
+}
+
+// leverage of options for build info
+// withErrors - will add an errors fields in output if error sent into Update()
 // withName - will add a name of calling function
 // withSinceStart -  will add duration of since creation instance of Track
 // withDuration - will add a duration since previous call Update()
 // withTrack - will add a string which  visualize the called function duration
 type Options struct {
-	withErrors     bool
-	withName       bool
-	withSinceStart bool
-	withDuration   bool
-	withTrack      bool
+	withErrors,
+	withName,
+	withSinceStart,
+	withDuration,
+	withTrack,
+	withLink bool
 }
 
 func (t *Track) SetMessageFormat(s string) {
@@ -53,8 +66,8 @@ func New(callerSkip int) *Track {
 		callerSkip: callerSkip,
 	}
 	t.Data = append(t.Data, Meta{
-		start: time.Now(),
-		name:  t.trace(),
+		Start: time.Now(),
+		Name:  trace(t.callerSkip),
 	})
 
 	if t.Loggable {
@@ -71,11 +84,11 @@ func (t *Track) Update(err error) error {
 	}
 
 	meta := Meta{
-		name:     t.trace(),
-		start:    time.Now(),
-		dur:      t.Data[len(t.Data)-1].Since(),
-		startDif: t.Data[0].Since(),
-		err:      err,
+		Name:     trace(t.callerSkip),
+		Start:    time.Now(),
+		Dur:      t.Data[len(t.Data)-1].Since(),
+		StartDif: t.Data[0].Since(),
+		Err:      err,
 	}
 
 	t.Data = append(t.Data, meta)
@@ -87,18 +100,8 @@ func (t *Track) Update(err error) error {
 	return nil
 }
 
-// contains meta information about current function
-type MetaData []Meta
-type Meta struct {
-	name     string
-	start    time.Time
-	dur      time.Duration
-	startDif time.Duration
-	err      error
-}
-
 type RenderOptions struct {
-	Divider  int
+	Divider int
 }
 
 type TableRender struct {
@@ -107,6 +110,7 @@ type TableRender struct {
 }
 
 type JSONRender struct {
+	Out     io.Writer
 	Options *RenderOptions
 }
 
@@ -114,8 +118,8 @@ type JSONRender struct {
 func (m MetaData) MaxDuration() time.Duration {
 	var max time.Duration
 	for _, v := range m {
-		if max < v.dur {
-			max = v.dur
+		if max < v.Dur {
+			max = v.Dur
 		}
 	}
 	return max
@@ -124,21 +128,21 @@ func (m MetaData) MaxDuration() time.Duration {
 func (m MetaData) MinDuration() time.Duration {
 	var min time.Duration
 	// the first elem will always be with the smallest duration
-	// because it create on start, so we skipping it
+	// because it create on start, skip it
 	for i, e := range m[1:] {
-		if i == 0 || e.dur < min {
-			min = e.dur
+		if i == 0 || e.Dur < min {
+			min = e.Dur
 		}
 	}
 	return min
 }
 
 func (iter Meta) Since() time.Duration {
-	return time.Since(iter.start)
+	return time.Since(iter.Start)
 }
 
 func (iter Meta) info() string {
-	return fmt.Sprintf(msgFormat, iter.name, iter.startDif, iter.dur, )
+	return fmt.Sprintf(msgFormat, iter.Name, iter.StartDif, iter.Dur, )
 }
 
 func (tbr TableRender) Render(data MetaData, opt *Options) {
@@ -146,27 +150,37 @@ func (tbr TableRender) Render(data MetaData, opt *Options) {
 	headers = createHeaders(headers, opt)
 	table := tablewriter.NewWriter(tbr.Out)
 	table.SetHeader(headers)
-	fmt.Println(headers)
 
 	for i, v := range data {
 		var timeLine string
 
-		if v.err == nil {
-			v.err = errors.New("")
+		if v.Err == nil {
+			v.Err = errors.New("")
 		}
 
 		step := int(data.MaxDuration()) / tbr.Options.Divider
 
-		for k := 0; k < int(data[i].dur); k += step {
+		for k := 0; k < int(data[i].Dur); k += step {
 			timeLine = timeLine + "*"
 		}
 
-		values := createValues(opt, data[i], timeLine)
+		row := createRow(opt, data[i], timeLine)
 
-		table.Append(values)
+		table.Append(row)
 	}
 
 	table.Render()
+}
+
+func (jsr JSONRender) Render(data MetaData, opt *Options) {
+	payload, err := json.MarshalIndent(data, "", "	")
+	if err != nil {
+		log.Printf("err:%s; error marshaling data", err.Error(), )
+	}
+	_, err = jsr.Out.Write(payload)
+	if err != nil {
+		log.Printf("err:%s; error marshaling data", err.Error(), )
+	}
 }
 
 func createHeaders(s []string, opt *Options) []string {
@@ -181,6 +195,7 @@ func createHeaders(s []string, opt *Options) []string {
 	}
 	if opt.withErrors {
 		s = append(s, "errors")
+
 	}
 	if opt.withTrack {
 		s = append(s, "track")
@@ -188,22 +203,22 @@ func createHeaders(s []string, opt *Options) []string {
 	return s
 }
 
-func createValues(opt *Options, meta Meta, timeLine string) []string {
+func createRow(opt *Options, meta Meta, timeLine string) []string {
 	s := make([]string, 0, 5)
 	if opt.withName {
-		s = append(s, meta.name)
+		s = append(s, meta.Name)
 	}
 	if opt.withSinceStart {
-		s = append(s, meta.startDif.String())
+		s = append(s, meta.StartDif.String())
 	}
 	if opt.withDuration {
-		s = append(s, meta.dur.String())
+		s = append(s, meta.Dur.String())
 	}
 	if opt.withErrors {
-		if meta.err == nil {
+		if meta.Err == nil {
 			s = append(s, "")
 		} else {
-			s = append(s, meta.err.Error())
+			s = append(s, meta.Err.Error())
 		}
 	}
 	if opt.withTrack {
@@ -246,14 +261,14 @@ func (t *Track) SetRenderer(render Renderer) {
 	t.Renderer = render
 }
 
-//returns the name of the function in which it is called
-func (t Track) trace() string {
-	pc := make([]uintptr, 10)
-	runtime.Callers(t.callerSkip, pc)
-	f := runtime.FuncForPC(pc[0])
-	return f.Name()
-}
-
 func (t *Track) Render() {
 	t.Renderer.Render(t.Data, t.options)
+}
+
+//returns the name of the function in which it is called
+func trace(skip int) string {
+	pc := make([]uintptr, skip)
+	runtime.Callers(skip, pc)
+	f := runtime.FuncForPC(pc[0])
+	return f.Name()
 }
